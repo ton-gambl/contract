@@ -1,0 +1,737 @@
+#include "stdlib.fc";
+
+;;
+;; TON LOTTERY '7 of 49'
+;; NFT Collection
+;; Oficial Bot: https://t.me/LotteryTonBot
+;;
+;; Lottery rules:
+;; Guess 7 numbers from 1 to 49 and win the Jackpot 💎
+;; 2 of 7 - х1
+;; 3 of 7 - х3
+;; 4 of 7 - х7
+;; 5 of 7 - х70
+;; 6 of 7 - х2000
+;; 7 of 7 - Jackpot 💎 (min х10000)
+;;
+
+;;
+;; errors
+;;
+
+int error::invalid_workchain() asm "100 PUSHINT";
+int error::the_same_numbers() asm "101 PUSHINT";
+int error::invalid_command() asm "102 PUSHINT";
+int error::invalid_owner_address() asm "103 PUSHINT";
+int error::the_contract_is_off() asm "104 PUSHINT";
+int error::not_enough_ton() asm "105 PUSHINT";
+int error::another_round() asm "106 PUSHINT";
+int error::invalid_nft_address() asm "107 PUSHINT";
+int error::invalid_nft_random_address() asm "108 PUSHINT";
+int error::invalid_password() asm "109 PUSHINT";
+int error::invalid_starting_time() asm "110 PUSHINT";
+int error::numbers_out_of_range() asm "111 PUSHINT";
+int errot::invalid_ref_addr_key() asm "112 PUSHINT";
+
+;;
+;; op codes
+;;
+
+int op::mint_nft_payload() asm "1 PUSHINT";
+int op::mint_nft_ticket() asm "2 PUSHINT";
+int op::mint_nft_random() asm "3 PUSHINT";
+int op::start() asm "4 PUSHINT";
+int op::msg_to_nft() asm "5 PUSHINT";
+int op::win_msg_to_nft() asm "6 PUSHINT";
+int op::withdraw() asm "7 PUSHINT";
+int op::new_price() asm "8 PUSHINT";
+int op::on() asm "9 PUSHINT";
+int op::off() asm "10 PUSHINT";
+int op::jackpot() asm "11 PUSHINT";
+int op::add_ref() asm "12 PUSHINT";
+int op::del_ref() asm "13 PUSHINT";
+int op::change_other() asm "14 PUSHINT";
+int op::destroy() asm "20 PUSHINT";
+
+;;
+;; other
+;;
+
+int percent::15() asm "15 PUSHINT"; ;; 1,5%
+int percent::30() asm "30 PUSHINT"; ;; 3%
+int percent::50() asm "50 PUSHINT"; ;; 5%
+int ton::new_jackpot() asm "10000 PUSHINT"; ;; x10000
+
+int workchain() asm "0 PUSHINT";
+() force_chain(slice addr) impure {
+  (int wc, _) = parse_std_addr(addr);
+  throw_unless(error::invalid_workchain(), wc == workchain());
+}
+
+
+(slice, int, cell, cell, cell, int, int, int, int, int, int, int, int, int, cell) load_data() inline {
+  var ds = get_data().begin_parse();
+  return 
+    (ds~load_msg_addr(), ;; owner_address
+     ds~load_uint(64), ;; next_item_index
+     ds~load_ref(), ;; content
+     ds~load_ref(), ;; nft_item_code
+     ds~load_ref(), ;; other (percent_jackpot_without_ref, percent_jackpot_with_ref, percent_profit_owner, percent_profit_ref, time_round)
+     ds~load_uint(32), ;; pass
+     ds~load_uint(1), ;; on|off
+     ds~load_uint(64), ;; ticket_price
+     ds~load_uint(64), ;; jackpot
+     ds~load_uint(32), ;; round_index
+     ds~load_uint(32), ;; round_starting
+     ds~load_uint(64), ;; first_ticket
+     ds~load_uint(64), ;; last_first_ticket
+     ds~load_uint(64), ;; last_random_ticket     
+    (ds.slice_bits() > 0 ? ds~load_dict() : new_dict()));  ;; dict_ref
+}
+
+
+() save_data(slice owner_address, int next_item_index, cell content, cell nft_item_code, cell other, int pass, int on, int ticket_price, int jackpot, int round_index, int round_starting, int first_ticket, int last_first_ticket, int last_random_ticket, cell dict_ref) impure inline {
+  set_data(begin_cell()
+    .store_slice(owner_address)
+    .store_uint(next_item_index, 64)
+    .store_ref(content)
+    .store_ref(nft_item_code)
+    .store_ref(other)
+    .store_uint(pass, 32)
+    .store_uint(on, 1)
+    .store_uint(ticket_price, 64)
+    .store_uint(jackpot, 64)
+    .store_uint(round_index, 32)
+    .store_uint(round_starting, 32)
+    .store_uint(first_ticket, 64)
+    .store_uint(last_first_ticket, 64)
+    .store_uint(last_random_ticket, 64)
+    .store_dict(dict_ref)
+    .end_cell());
+}
+
+
+cell calculate_nft_item_state_init(int next_item_index, cell nft_item_code) {
+  cell data = begin_cell().store_uint(next_item_index, 64).store_slice(my_address()).end_cell();
+  return begin_cell().store_uint(0, 2).store_dict(nft_item_code).store_dict(data).store_uint(0, 1).end_cell();
+}
+
+
+slice calculate_nft_item_address(int wc, cell state_init) {
+  return begin_cell()
+        .store_uint(4, 3)
+        .store_int(wc, 8)
+        .store_uint(cell_hash(state_init), 256)
+        .end_cell()
+        .begin_parse();
+}
+
+
+() deploy_nft_item(int next_item_index, cell nft_item_code, int amount, slice address, cell content, cell numbers, int round_index) impure {
+  cell state_init = calculate_nft_item_state_init(next_item_index, nft_item_code);
+  slice nft_address = calculate_nft_item_address(workchain(), state_init);
+
+  cell empty_random_numbers = begin_cell().store_uint(0, 8).store_uint(0, 8).store_uint(0, 8).store_uint(0, 8).store_uint(0, 8).store_uint(0, 8).store_uint(0, 8).end_cell();
+  cell message = begin_cell()
+                .store_slice(address)
+                .store_ref(content)
+                .store_ref(numbers)
+                .store_uint(round_index, 32)
+                .store_ref(empty_random_numbers)
+                .end_cell();
+
+  var msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(nft_address)
+            .store_coins(amount)
+            .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+            .store_ref(state_init)
+            .store_ref(message);
+  send_raw_message(msg.end_cell(), 1); 
+}
+
+
+cell random_numbers() {
+  randomize_lt();
+    int r1 = rand(49);
+    while (r1 == 0) {
+      r1 = rand(49);
+    }
+    int r2 = rand(49);
+    while ((r2 == 0) | (r2 == r1)) {
+      r2 = rand(49);
+    }
+    int r3 = rand(49);
+    while ((r3 == 0) | (r3 == r1) | (r3 == r2)) {
+      r3 = rand(49);
+    }
+    int r4 = rand(49);
+    while ((r4 == 0) | (r4 == r1) | (r4 == r2) | (r4 == r3)) {
+      r4 = rand(49);
+    }
+    int r5 = rand(49);
+    while ((r5 == 0) | (r5 == r1) | (r5 == r2) | (r5 == r3) | (r5 == r4)) {
+      r5 = rand(49);
+    }
+    int r6 = rand(49);
+    while ((r6 == 0) | (r6 == r1) | (r6 == r2) | (r6 == r3) | (r6 == r4) | (r6 == r5)) {
+      r6 = rand(49);
+    }
+    int r7 = rand(49);
+    while ((r7 == 0) | (r7 == r1) | (r7 == r2) | (r7 == r3) | (r7 == r4) | (r7 == r5) | (r7 == r6)) {
+      r7 = rand(49);
+    }
+
+return begin_cell().store_uint(r1, 8).store_uint(r2, 8).store_uint(r3, 8).store_uint(r4, 8).store_uint(r5, 8).store_uint(r6, 8).store_uint(r7, 8).end_cell();
+}
+
+
+() send_msg(slice to_address, int amount, int op, int query_id, int send_mode) impure inline {
+  var msg = begin_cell()
+            .store_uint(0x10, 6) 
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op, 32)
+            .store_uint(query_id, 64)
+            .end_cell();
+  send_raw_message(msg, send_mode);
+}
+
+
+() send_msg_text(slice to_address, int amount, slice msg_body, int send_mode) impure inline {
+  var msg = begin_cell()
+            .store_uint(0x10, 6) 
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(0, 32)
+            .store_slice(msg_body)
+            .end_cell();
+  send_raw_message(msg, send_mode);
+}
+
+
+() send_msg_payload(slice to_address, int amount, int op, int query_id, cell msg_body, int send_mode) impure inline {
+  var msg = begin_cell()
+            .store_uint(0x10, 6) 
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op, 32)
+            .store_uint(query_id, 64)
+            .store_ref(msg_body)
+            .end_cell();
+  send_raw_message(msg, send_mode);
+}
+
+
+(slice, int) char_number(slice msg) impure {
+  int number = (msg~load_uint(8) - 48); 
+  if (~ msg.slice_empty?()) {
+    if (msg.preload_uint(8) != 32) { 
+      number = number * 10 + (msg~load_uint(8) - 48); 
+    } 
+  }
+  if (~ msg.slice_empty?()) {
+    msg~skip_bits(8);
+  }
+return (msg, number);
+}
+
+
+int char_int(int char) {
+  if ((char >= 48) & (char <= 57)) { 
+    char = char - 48;
+  } elseif ((char >= 97) & (char <= 102)) { 
+  char = char - 87;
+  }
+  return char;
+}
+
+
+(slice, int, slice, cell) parse_text(slice msg, int addr_key) impure {
+  slice text = msg;
+  int ref_addr_key = addr_key;
+
+  int n1 = msg~char_number();
+  int n2 = msg~char_number();
+  int n3 = msg~char_number();
+  int n4 = msg~char_number();
+  int n5 = msg~char_number();
+  int n6 = msg~char_number();
+  int n7 = msg~char_number();
+
+  if ((n1 < 1) | (n2 < 1) | (n3 < 1) | (n4 < 1) | (n5 < 1) | (n6 < 1) | (n7 < 1) | (n1 > 49) | (n2 > 49) | (n3 > 49) | (n4 > 49) | (n5 > 49) | (n6 > 49) | (n7 > 49)) {
+    throw(error::numbers_out_of_range());
+  }
+
+  if ((n1 == n2) | (n1 == n3) | (n1 == n4) | (n1 == n5) | (n1 == n6) | (n1 == n7) | (n2 == n3) | (n2 == n4) | (n2 == n5) | (n2 == n6) | (n2 == n7) | (n3 == n4) | (n3 == n5) | (n3 == n6) | (n3 == n7) | (n4 == n5) | (n4 == n6) | (n4 == n7) | (n5 == n6) | (n5 == n7) | (n6 == n7)) {
+    throw(error::the_same_numbers());
+  }
+
+  cell numbers = begin_cell().store_uint(n1, 8).store_uint(n2, 8).store_uint(n3, 8).store_uint(n4, 8).store_uint(n5, 8).store_uint(n6, 8).store_uint(n7, 8).end_cell();
+
+  if (~ msg.slice_empty?()) {
+    builder add = begin_cell();
+    while (~ msg.slice_empty?()) {
+      int char = msg~load_uint(8);
+      add = add.store_uint(char_int(char), 4);
+    }
+    slice ref_addr = add.end_cell().begin_parse();
+    
+    ref_addr_key = ref_addr~load_uint(256); 
+    
+    text~skip_last_bits(512 + 8);
+  }
+return (msg, ref_addr_key, text, numbers);
+}
+
+
+(slice, int) parse_msg(slice msg) impure {
+  int op = 0;
+  int first_char = msg.preload_uint(8);
+
+  if ((first_char >=  48) & (first_char <= 57)) {
+    op = op::mint_nft_ticket(); 
+  }
+  if (first_char == 114) { ;; r
+    throw_unless(error::invalid_command(), msg~load_uint(48) == 125762789470061); ;; random
+    op = op::mint_nft_random();
+  }
+  if (first_char == 115) { ;; s
+    throw_unless(error::invalid_command(), msg~load_uint(40) == 495873782388); ;; start
+    op = op::start();
+  }
+  if (first_char == 119) { ;; w
+    throw_unless(error::invalid_command(), msg~load_uint(64) == 8604536554778681719); ;; withdraw  
+    op = op::withdraw();
+  }
+  if (first_char == 112) { ;; p
+    throw_unless(error::invalid_command(), msg~load_uint(40) == 482955846501); ;; price
+    op = op::new_price();
+  }
+  if (first_char == 111) { ;; o
+    throw_unless(error::invalid_command(), msg~load_uint(16) == 28526); ;; on
+    op = op::on();
+  }
+  if (first_char == 102) { ;; f
+    throw_unless(error::invalid_command(), msg~load_uint(16) == 26214); ;; ff (off)
+    op = op::off();
+  }
+  if (first_char == 106) { ;; j
+    throw_unless(error::invalid_command(), msg~load_uint(56) == 29943427163516788); ;; jackpot
+    op = op::jackpot();
+  }
+return (msg, op);
+}
+
+
+int percent(int ticket_price, int amount) {
+  int percent = ticket_price / 1000 * amount;
+return percent;
+}
+
+
+cell create_content(slice text) {
+  cell dict_content = new_dict();
+  dict_content~udict_set_ref(256, 0x82a3537ff0dbce7eec35d69edc3a189ee6f17d82f353a553f9aa96cb0be3ce89, begin_cell().store_uint(0, 8).store_slice(text).end_cell()); ;; name
+  dict_content~udict_set_ref(256, 0xc9046f7a37ad0ea7cee73355984fa5428982f8b37c8f7bcec91f7ac71a7cd104, begin_cell().store_uint(0, 8).store_slice("TON LOT '7 of 49'").end_cell()); ;; description
+  dict_content~udict_set_ref(256, 0x6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d, begin_cell().store_uint(0, 8).store_slice("https://raw.githubusercontent.com/ton-gambl/contract/main/fone.png").end_cell()); ;; image
+return begin_cell().store_uint(0, 8).store_dict(dict_content).end_cell();
+}
+
+
+cell create_content_random() {
+  cell dict_content = new_dict();
+  dict_content~udict_set_ref(256, 0x82a3537ff0dbce7eec35d69edc3a189ee6f17d82f353a553f9aa96cb0be3ce89, begin_cell().store_uint(0, 8).store_slice("Random Numbers").end_cell()); ;; name
+  dict_content~udict_set_ref(256, 0xc9046f7a37ad0ea7cee73355984fa5428982f8b37c8f7bcec91f7ac71a7cd104, begin_cell().store_uint(0, 8).store_slice("TON LOT '7 of 49'").end_cell()); ;; description
+  dict_content~udict_set_ref(256, 0x6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d, begin_cell().store_uint(0, 8).store_slice("https://raw.githubusercontent.com/ton-gambl/contract/main/fone-black.png").end_cell()); ;; image
+return begin_cell().store_uint(0, 8).store_dict(dict_content).end_cell();
+}
+
+
+() recv_internal(int balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    
+  if (in_msg_body.slice_empty?()) { 
+      return ();
+  }
+ 
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  if (flags & 1) { 
+      return ();
+  }
+
+  var (owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref) = load_data();
+
+  slice other_slice = other.begin_parse();
+  int percent_jackpot_without_ref = other_slice~load_uint(32);
+  int percent_jackpot_with_ref = other_slice~load_uint(32); 
+  int percent_profit_owner = other_slice~load_uint(32);
+  int percent_profit_ref = other_slice~load_uint(32);
+  int time_round = other_slice~load_uint(32);
+
+  slice sender_address = cs~load_msg_addr();
+  int op = in_msg_body~load_uint(32); 
+
+  if (op == 0 ) { 
+      op = in_msg_body~parse_msg(); 
+    }
+  
+;;
+;; mint NFT ticket
+;; choose 7 numbers from 1 to 49 
+;; send a message to the address of the collection and write the number separated by a space in the comment (example: 1 2 3 4 5 6 7)
+;; ticket price = 2$
+;; or use telegram bot https://t.me/LotteryTonBot
+;;
+  
+  if (op == op::mint_nft_ticket()) { ;; mint NFT ticket
+  throw_unless(error::the_contract_is_off(), on == 1); 
+  throw_unless(error::not_enough_ton(), msg_value >= ticket_price);
+
+    (_, int owner_addr_key) = parse_std_addr(owner_address);
+  
+    (_, int ref_addr_key, slice text, cell numbers) = parse_text(in_msg_body, owner_addr_key);
+    
+    deploy_nft_item(next_item_index, nft_item_code, percent(ticket_price, percent::50()), sender_address, create_content(text), numbers, round_index);
+    next_item_index += 1;
+
+    if (ref_addr_key != owner_addr_key) {
+      (slice count_slice, int f) = dict_ref.udict_get?(256, ref_addr_key);
+        if (f) {
+          int count = count_slice~load_uint(64);
+          count += percent(ticket_price, percent_profit_ref); ;; 5% ref
+          slice count_end = begin_cell().store_uint(count, 64).end_cell().begin_parse();
+          dict_ref~udict_set(256, ref_addr_key, count_end);
+
+          jackpot += percent(ticket_price, percent_jackpot_with_ref); ;; 30% jackpot
+        } else {
+          throw(errot::invalid_ref_addr_key());
+        }
+    } else {
+      jackpot += percent(ticket_price, percent_jackpot_without_ref); ;; 40% jackpot
+    }
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+;;
+;; mint NFT ticket this random numbers to lottery drawing
+;;
+
+  if (op == op::mint_nft_random()) { ;; mint NFT ticket this random numbers to lottery drawing
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address)); 
+
+    deploy_nft_item(next_item_index, nft_item_code, percent(ticket_price, percent::50()), my_address(), create_content_random(), random_numbers(), round_index);
+
+    last_first_ticket = first_ticket;
+    last_random_ticket = next_item_index;
+
+    round_starting = now() + time_round; 
+    next_item_index += 1;
+    first_ticket = next_item_index;
+    round_index += 1;
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  send_msg_text(owner_address, msg_value, "New round '7 of 49'", 1);
+  return ();
+  }
+
+
+  if (op == op::start()) { ;; start
+  throw_unless(error::invalid_owner_address(), (equal_slices(sender_address, owner_address)));
+  
+    cell state_init = calculate_nft_item_state_init(last_random_ticket, nft_item_code);
+    slice nft_rand_address = calculate_nft_item_address(workchain(), state_init);
+
+    int tickets = last_random_ticket - last_first_ticket;
+
+    (_, int owner_addr_key) = parse_std_addr(owner_address);
+    (slice count_slice, int f) = dict_ref.udict_get?(256, owner_addr_key);
+
+    int count = count_slice~load_uint(64);
+    count += percent(ticket_price, percent_profit_owner) * tickets; ;; 10% owner
+    slice count_end = begin_cell().store_uint(count, 64).end_cell().begin_parse();
+    dict_ref~udict_set(256, owner_addr_key, count_end);
+    
+    int fee_amount = (percent(ticket_price, percent::50()) * tickets); ;; 5% fee
+
+    cell msg_body = begin_cell().store_uint(last_first_ticket, 64).end_cell();
+
+    send_msg_payload(nft_rand_address, fee_amount, 3, cur_lt(), msg_body, 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::withdraw()) { ;; withdraw
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address)); 
+    
+    int addr_key = 0;
+    do {
+    (addr_key, slice count_slice, int f) = dict_ref.udict_get_next?(256, addr_key); 
+      if(f) {
+        int count = count_slice~load_uint(64);
+
+        if (count > 0) {
+          slice ref_address = begin_cell()
+                              .store_uint(4, 3)
+                              .store_int(workchain(), 8)
+                              .store_uint(addr_key, 256)
+                              .end_cell().begin_parse();
+
+          send_msg_text(ref_address, count, "Profit from the lottery '7 of 49'", 1);
+          
+          slice count_end = begin_cell().store_uint(0, 64).end_cell().begin_parse();
+          dict_ref~udict_set(256, addr_key, count_end);
+        }
+      }
+    } until (~ f); 
+
+    send_msg_text(owner_address, msg_value, "Withdraw complited", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::new_price()) { ;; new ticket price
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address)); 
+
+    send_msg_text(owner_address, msg_value, "The ticket price has been changed", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, msg_value, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::on()) { ;; on
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address));
+
+    send_msg_text(owner_address, msg_value, "Contract is 'ON'", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, 1, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::off()) { ;; off
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address));
+
+    send_msg_text(owner_address, msg_value, "Contract is 'OFF'", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, 0, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::jackpot()) { ;; jackpot
+
+    jackpot += msg_value;
+    send_msg_text(owner_address, 0, "Jackpot upgraded", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  int query_id = in_msg_body~load_uint(64);
+
+
+  if (op == op::msg_to_nft()) { ;; msgs to NFTs
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int index = message~load_uint(64);
+    int round = message~load_uint(32);
+    cell random_numbers = message~load_ref();
+    int next_index = message~load_uint(64);
+
+  throw_unless(error::another_round(), round == (round_index - 1));
+
+    cell state_init = calculate_nft_item_state_init(index, nft_item_code);
+    slice nft_rand_address = calculate_nft_item_address(workchain(), state_init);
+
+  throw_unless(error::invalid_nft_random_address(), equal_slices(sender_address, nft_rand_address));
+
+    int fee_amount = percent(ticket_price, percent::30()) * (last_random_ticket - next_index); ;; 3% fee
+    int nft_amount = percent(ticket_price, percent::30()); ;; 3% fee
+    int end_index = next_index + 200;
+
+    while ((next_index < end_index) & (next_index < last_random_ticket)) {
+  
+      cell state_init = calculate_nft_item_state_init(next_index, nft_item_code);
+      slice nft_address = calculate_nft_item_address(workchain(), state_init);
+
+      send_msg_payload(nft_address, nft_amount, 1, query_id, random_numbers, 1);
+
+      next_index += 1;
+
+      if (next_index == end_index) {
+        cell msg_body = begin_cell().store_uint(next_index, 64).end_cell();
+        send_msg_payload(nft_rand_address, fee_amount, 3, cur_lt(), msg_body, 1);
+      }
+    }
+  return ();
+  }
+
+
+  if (op == op::win_msg_to_nft()) { ;; win msgs to NFTs
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int index = message~load_uint(64);
+    int round = message~load_uint(32);
+    int win = message~load_uint(32);
+    cell win_msg = message~load_ref();
+
+  throw_unless(error::another_round(), round == (round_index - 1));
+
+    cell state_init = calculate_nft_item_state_init(index, nft_item_code);
+    slice nft_address = calculate_nft_item_address(workchain(), state_init);
+
+  throw_unless(error::invalid_nft_address(), equal_slices(sender_address, nft_address));
+
+    if (win == 777) {
+      int new_jackpot = ticket_price * ton::new_jackpot();
+      int this_jackpot = balance - new_jackpot;
+      send_msg_payload(nft_address, this_jackpot, 2, query_id, win_msg, 1);
+      jackpot = new_jackpot;
+      send_msg_text(owner_address, 0, "Jackpot '7 of 49' has been winning", 1);
+      
+    } else {
+      int win_amount = ticket_price * win; 
+      
+      if (win == 0) {
+        win_amount = percent(ticket_price, percent::15()); ;; 1,5%
+      }
+      send_msg_payload(nft_address, win_amount, 2, query_id, win_msg, 1);
+    }
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::add_ref()) { ;; ref addr key add
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address));
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int password = message~load_uint(32);
+
+  throw_unless(error::invalid_password(), password == pass);
+
+    slice ref_address = message~load_msg_addr();
+    (_, int ref_addr_key) = parse_std_addr(ref_address);
+
+    slice count_end = begin_cell().store_uint(0, 64).end_cell().begin_parse();
+    dict_ref~udict_set(256, ref_addr_key, count_end);
+
+    send_msg_text(owner_address, msg_value, "Ref addr key added", 1);
+    send_msg_text(ref_address, 0, "Your ref addr key has been added", 1);
+    
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::del_ref()) { ;; ref addr key delete
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address));
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int password = message~load_uint(32);
+
+  throw_unless(error::invalid_password(), password == pass);
+
+    slice ref_address = message~load_msg_addr();
+    (_, int ref_addr_key) = parse_std_addr(ref_address);
+
+    dict_ref~udict_delete?(256, ref_addr_key);
+
+    send_msg_text(owner_address, msg_value, "Ref addr key deleted", 1);
+    send_msg_text(ref_address, 0, "Your ref addr key has been deleted", 1);
+    
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::change_other()) { ;; change other
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address));
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int password = message~load_uint(32);
+
+  throw_unless(error::invalid_password(), password == pass);
+
+    int percent_jackpot_without_ref = message~load_uint(32);
+    int percent_jackpot_with_ref = message~load_uint(32); 
+    int percent_profit_owner = message~load_uint(32);
+    int percent_profit_ref = message~load_uint(32);
+    int time_round = message~load_uint(32);
+
+    other = begin_cell().store_uint(percent_jackpot_without_ref, 32).store_uint(percent_jackpot_with_ref, 32).store_uint(percent_profit_owner, 32).store_uint(percent_profit_ref, 32).store_uint(time_round, 32).end_cell();
+
+    send_msg_text(owner_address, msg_value, "Other has been changed", 1);
+
+  save_data(owner_address, next_item_index, content, nft_item_code, other, pass, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, dict_ref);
+  return ();
+  }
+
+
+  if (op == op::destroy()) { ;; destroy
+  throw_unless(error::invalid_owner_address(), equal_slices(sender_address, owner_address)); 
+
+    slice message = in_msg_body~load_ref().begin_parse();
+    int password = message~load_uint(32);
+
+  throw_unless(error::invalid_password(), password == pass);
+
+    send_msg_text(owner_address, 0, "Contract has beed destroyed", 160);
+
+  return ();
+  }
+
+throw(0xffff);
+}
+
+;;
+;; Get methods
+;;
+
+(int, cell, slice) get_collection_data() method_id {
+  var (owner_address, next_item_index, content, _, _, _, _, _, _, _, _, _, _, _, _) = load_data();
+  return (next_item_index, content, owner_address);
+}
+
+slice get_nft_address_by_index(int index) method_id {
+    var (_, _, _, nft_item_code, _, _, _, _, _, _, _, _, _, _, _) = load_data();
+    cell state_init = calculate_nft_item_state_init(index, nft_item_code);
+    return calculate_nft_item_address(workchain(), state_init);
+}
+
+cell get_nft_content(int index, cell individual_nft_content) method_id { 
+  return individual_nft_content;
+}
+
+(slice, int, cell, int, int, int, int, int, int, int, int) get_collection_info() method_id {
+  var (owner_address, next_item_index, _, _, other, _, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket, _) = load_data();
+  
+  return (owner_address, next_item_index, other, on, ticket_price, jackpot, round_index, round_starting, first_ticket, last_first_ticket, last_random_ticket);
+}
+
+(int) get_ref_profit(slice addr) method_id {
+	var (_, _, _, _, _, _, _, _, _, _, _, _, _, _, dict_ref) = load_data();
+  (_, int key_address) = parse_std_addr(addr);
+  (slice count_slice, int f) = dict_ref.udict_get?(256, key_address);
+  if (f) {
+    int count = count_slice~load_uint(64);
+    return (count);
+  } else {
+    int count = -1;
+    return (count);
+  }
+}
